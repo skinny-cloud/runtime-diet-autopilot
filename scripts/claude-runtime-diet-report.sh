@@ -83,6 +83,25 @@ else
 fi
 say() { $COLOR_ENABLED && printf '%s\n' "$*" >&2 || true; }
 
+# NXTG-branded scanning spinner (signal-green, quarter-circle rotation).
+# Renders to stderr only when stderr is a TTY; silent otherwise. Caller is
+# responsible for `wait $pid` after this returns to surface non-zero exits.
+_spin() {
+  local label="$1" pid="$2"
+  local frames=( "◐" "◓" "◑" "◒" )
+  local i=0
+  local SG=$'\e[38;2;0;214;122m'
+  if [[ ! -t 2 ]]; then
+    return 0
+  fi
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s' "$SG" "${frames[i % 4]}" "$R" "$label" >&2
+    i=$((i + 1))
+    sleep 0.12
+  done
+  printf '\r%*s\r' 60 '' >&2
+}
+
 # ---- text wrap helper (plain text, fixed width, hard-cut on long tokens) ----
 # wrap_text WIDTH "text..."  -> emits one wrapped line per stdout line.
 # Splits on whitespace; any single token longer than WIDTH is hard-cut.
@@ -130,12 +149,24 @@ card_wrap() {
   done < <(wrap_text "$CARD_INNER" "$1")
 }
 
-# Same for the colorized stderr render. Color codes wrap each plain line so
-# the %-Ns padding math (which only sees plain chars) stays correct.
+# Strip ANSI escape sequences so visible-width math is correct on colored rows.
+strip_ansi() {
+  printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+# Same for the colorized stderr render. Color codes inflate byte length, so we
+# measure visible width on the ANSI-stripped content and pad manually.
 say_card_line() {
   $COLOR_ENABLED || return 0
-  printf '%s%s┃%s %s%-*s%s %s%s┃%s\n' \
-    "$B" "$MG" "$R" "$2" "$CARD_INNER" "$1" "$R" "$B" "$MG" "$R" >&2
+  local content="$1" color="$2"
+  local stripped visible_len pad spaces
+  stripped="$(strip_ansi "$content")"
+  visible_len=${#stripped}
+  pad=$(( CARD_INNER - visible_len ))
+  (( pad < 0 )) && pad=0
+  spaces="$(printf '%*s' "$pad" '')"
+  printf '%s%s┃%s %s%s%s%s %s%s┃%s\n' \
+    "$B" "$MG" "$R" "$color" "$content" "$R" "$spaces" "$B" "$MG" "$R" >&2
 }
 say_card_wrap() {
   local color="${2:-}" line
@@ -145,8 +176,19 @@ say_card_wrap() {
 }
 
 # ---- run baseline ----
-say "${D}[1/4] Generating baseline...${R}"
-bash "$BASELINE_SCRIPT" "${BASELINE_ARGS[@]}" "$PROJECT_DIR" > "$BASELINE_FILE"
+# Background the baseline so the NXTG spinner can run concurrently. Suppress
+# the baseline's own ANSI stderr while the spinner is active so the two don't
+# overlap on the same line; restore stderr for non-TTY callers (CI, pipes).
+if [[ -t 2 ]]; then
+  bash "$BASELINE_SCRIPT" "${BASELINE_ARGS[@]}" "$PROJECT_DIR" > "$BASELINE_FILE" 2>/dev/null &
+  _baseline_pid=$!
+  _spin "auditing context surfaces..." "$_baseline_pid"
+  wait "$_baseline_pid"
+  say "${D}[1/4] Baseline generated.${R}"
+else
+  say "${D}[1/4] Generating baseline...${R}"
+  bash "$BASELINE_SCRIPT" "${BASELINE_ARGS[@]}" "$PROJECT_DIR" > "$BASELINE_FILE"
+fi
 
 # ---- extract structured rows from baseline ----
 say "${D}[2/4] Extracting top surfaces and hidden memory...${R}"
@@ -184,6 +226,33 @@ PI_COUNT="${PI_COUNT:-0}"
 HOOK_COUNT="$(
   awk '/^## Hook Summary/{i=1;next} i&&/^## /{exit} i&&/^- /{c++} END{print c+0}' "$BASELINE_FILE"
 )"
+
+# MCP server count: check ~/.claude.json (Claude Code config), ~/.claude/claude.json,
+# and ~/.claude/settings.json. Take the largest count seen.
+MCP_COUNT=0
+for f in "$HOME/.claude.json" "$HOME/.claude/claude.json" "$HOME/.claude/settings.json"; do
+  if [[ -f "$f" ]]; then
+    n="$(jq -r '(.mcpServers // {}) | length' "$f" 2>/dev/null || echo 0)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    (( n > MCP_COUNT )) && MCP_COUNT="$n"
+  fi
+done
+
+# Agents count: visible subdirs (excluding `.archive` and the parent itself) plus
+# top-level .md files under ~/.claude/agents. Use -L so symlinks are followed.
+AGENTS_COUNT=0
+if [[ -d "$HOME/.claude/agents" ]]; then
+  agent_dirs="$(find -L "$HOME/.claude/agents" -maxdepth 1 -mindepth 1 -type d ! -name '.archive' 2>/dev/null | wc -l | tr -d ' ')"
+  agent_files="$(find -L "$HOME/.claude/agents" -maxdepth 1 -mindepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+  AGENTS_COUNT=$(( agent_dirs + agent_files ))
+fi
+
+# Skills count: subdirs under ~/.claude/skills (excluding the parent itself).
+# Use -L because ~/.claude/skills is commonly a symlink into a project dir.
+SKILLS_COUNT=0
+if [[ -d "$HOME/.claude/skills" || -L "$HOME/.claude/skills" ]]; then
+  SKILLS_COUNT="$(find -L "$HOME/.claude/skills" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+fi
 
 # ---- card surface signals ----
 LARGEST_SURFACE="$(awk -F '\t' 'NR==1 { print $4 " - " $3; exit }' "$TOP_TSV")"
@@ -225,7 +294,10 @@ SIGNALS_JSON="$(
     --arg branch "$LARGEST_BRANCH" \
     --argjson hooks "${HOOK_COUNT:-0}" \
     --argjson pi "${PI_COUNT:-0}" \
-    '{ranks:$ranks, branch:$branch, hooks:$hooks, pi:$pi}'
+    --argjson mcp "${MCP_COUNT:-0}" \
+    --argjson skills "${SKILLS_COUNT:-0}" \
+    --argjson agents "${AGENTS_COUNT:-0}" \
+    '{ranks:$ranks, branch:$branch, hooks:$hooks, pi:$pi, mcp:$mcp, skills:$skills, agents:$agents}'
 )"
 
 jq -r --argjson s "$SIGNALS_JSON" '
@@ -246,7 +318,17 @@ jq -r --argjson s "$SIGNALS_JSON" '
     + ( if ($matched == 1 and $rule.id == "instructions" and $s.pi    > 0) then 3 else 0 end)
     + ( if ($matched == 1 and ($s.branch | test($pat; "i")))               then 2 else 0 end)
     ) as $bonus
-  | ($rank_score + $bonus) as $score
+  | (
+      # Standalone signal score for tool-budget rule: fires from counts even when
+      # no top-5 surface path matches the pattern.
+      if $rule.id == "mcp_agents"
+      then (if $s.mcp    > 5 then 4 else 0 end)
+         + (if $s.skills > 5 then 3 else 0 end)
+         + (if $s.agents > 5 then 2 else 0 end)
+      else 0
+      end
+    ) as $signal_score
+  | ($rank_score + $bonus + $signal_score) as $score
   | select($score > 0)
   | [$score, $rule.id, $rule.title, $rule.reason, $rule.action] | @tsv
 ' "$RULES_FILE" | sort -t $'\t' -k1,1nr -k2,2 > "$SCORES_TSV"
@@ -342,6 +424,9 @@ say "${D}[3/4] Writing worksheet, card, passport, rule, index...${R}"
   echo "|---|---:|"
   echo "| Project instruction files found | ${PI_COUNT} |"
   echo "| Hooks configured | ${HOOK_COUNT} |"
+  echo "| MCP servers configured | ${MCP_COUNT} |"
+  echo "| Skills installed | ${SKILLS_COUNT} |"
+  echo "| Agents installed | ${AGENTS_COUNT} |"
   echo "| Top visible surface | $(md_escape "$LARGEST_SURFACE") |"
   echo "| Largest hidden project memory | $(md_escape "$LARGEST_MEMORY") |"
   echo "| Total hidden project memory | ${MEM_TOTAL_HUMAN} across ${MEM_PROJECT_COUNT} projects |"
@@ -379,7 +464,7 @@ say "${D}[3/4] Writing worksheet, card, passport, rule, index...${R}"
   echo "Largest recent session branch:"
   while IFS= read -r l; do echo "  $l"; done < <(wrap_text $((CARD_INNER - 2)) "$LARGEST_BRANCH")
   echo
-  echo "Hooks configured: $HOOK_COUNT"
+  echo "Hooks: $HOOK_COUNT | MCP servers: $MCP_COUNT | Skills: $SKILLS_COUNT | Agents: $AGENTS_COUNT"
   echo
   echo "Skills / rules surface:"
   while IFS= read -r l; do echo "  $l"; done < <(wrap_text $((CARD_INNER - 2)) "$RULES_SURFACE")
@@ -414,7 +499,7 @@ say "${D}[3/4] Writing worksheet, card, passport, rule, index...${R}"
   card_wrap "  $LARGEST_MEMORY"
   card_line ""
 
-  card_line "Hooks configured: $HOOK_COUNT"
+  card_line "Hooks: $HOOK_COUNT | MCP servers: $MCP_COUNT | Skills: $SKILLS_COUNT | Agents: $AGENTS_COUNT"
   card_line ""
 
   card_line "Skills / rules surface"
@@ -529,7 +614,7 @@ say_card_line "${CY}Largest hidden project memory${R}" ""
 say_card_wrap "  $LARGEST_MEMORY" "$YL"
 say_card_line "" ""
 
-say_card_line "${CY}Hooks configured${R}: ${B}${HOOK_COUNT}${R}" ""
+say_card_line "${CY}Hooks${R}: ${B}${HOOK_COUNT}${R} | ${CY}MCP servers${R}: ${B}${MCP_COUNT}${R} | ${CY}Skills${R}: ${B}${SKILLS_COUNT}${R} | ${CY}Agents${R}: ${B}${AGENTS_COUNT}${R}" ""
 say_card_line "" ""
 
 say_card_line "${CY}Top suspect${R}" ""
